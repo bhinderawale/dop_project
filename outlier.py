@@ -3,7 +3,7 @@ import torch.nn as nn
 import functools
 import math
 from tqdm import tqdm
-from qLlamaLayer import QLinearLayer
+from qLinearLayer import QLinearLayer
 
 @torch.no_grad()
 def get_act_stats_llama(model, dataloader, device_, metric='hessian'):
@@ -86,7 +86,8 @@ def get_act_stats_llama(model, dataloader, device_, metric='hessian'):
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     if not model.model.norm.weight.is_meta:
         model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -187,7 +188,8 @@ def get_act_stats_opt(model, dataloader, device_, metric='hessian'):
         model.model.decoder.project_out = model.model.decoder.project_out.cpu()
     if hasattr(model.model.decoder, 'project_in') and model.model.decoder.project_in:
         model.model.decoder.project_in = model.model.decoder.project_in.cpu()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
@@ -198,7 +200,8 @@ def get_act_stats_opt(model, dataloader, device_, metric='hessian'):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         inps, outs = outs, inps
 
     for h in hooks:
@@ -319,7 +322,8 @@ def get_act_scales(model, dataloader, device_, args):
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']

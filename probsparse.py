@@ -5,7 +5,7 @@ import numpy as np
 import torch.nn.functional as F
 beta = 0.15
 gamma = 0.25
-from utils.masking import TriangularCausalMask, ProbMask
+from masking import TriangularCausalMask, ProbMask
 import torch
 from typing import Optional
 from quant import Quantizer, fake_quantize_quarter_E5M2, fake_quantize_quarter_E4M3, quantize_tensor, quantize_tensor_channel_group
@@ -24,51 +24,55 @@ class InferenceModule(torch.nn.Module):
                 mod.inference()
 
 class Value(InferenceModule):
-    def __init__(self, dim_input, dim_val):
+    def __init__(self, dim_input, dim_val, args):
         super(Value, self).__init__()
         self.dim_val = dim_val
-        self.fc1 = QLinearLayer(self.fc1, args)
+        self.fc1 = QLinearLayer(nn.Linear(dim_input, dim_val, bias=False), args)
 
     def forward(self, x):
         return self.fc1(x)
 
 class Key(InferenceModule):
-    def __init__(self, dim_input, dim_attn):
+    def __init__(self, dim_input, dim_attn, args):
         super(Key, self).__init__()
         self.dim_attn = dim_attn
-        self.fc1 = QLinearLayer(self.fc1, args)
+        self.fc1 =QLinearLayer(nn.Linear(dim_input, dim_attn, bias=False), args)
 
     def forward(self, x):
         return self.fc1(x)
 
 class Query(InferenceModule):
-    def __init__(self, dim_input, dim_attn):
+    def __init__(self, dim_input, dim_attn, args):
         super(Query, self).__init__()
         self.dim_attn = dim_attn
-        self.fc1 = QLinearLayer(self.fc1, args)
+        self.fc1 = nn.Linear(dim_input, dim_attn, bias=False)
 
     def forward(self, x):
         return self.fc1(x)
 
 class ProbAttention(nn.Module):
-    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False):
+    def __init__(self, mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False, args = None):
         super(ProbAttention, self).__init__()
+        assert args is not None  
         self.factor = factor
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
         self.act_quant = Quantizer(args=args)
-        
+        self.k_quant = Quantizer(args=args)
+        self.v_quant = Quantizer(args=args)
+
     def _prob_QK(self, Q, K, sample_k, n_top): # n_top: c*ln(L_q)  #32x8x96x64 , 25, 25
+        device =Q.device
         # Q [B, H, L, D]
         B, H, L_K, E = K.shape #32x8x96x64
         _, _, L_Q, _ = Q.shape #96
 
         # calculate the sampled Q_K
         K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E) #32x8x96x96x64
-        index_sample = torch.randint(L_K, (L_Q, sample_k), device= 'cuda') # real U = U_part(factor*ln(L_k))*L_q #96x25
-        K_sample = K_expand[:, :, torch.arange(L_Q, device ='cuda').unsqueeze(1), index_sample, :] #32x8x96x25x64
+        index_sample = torch.randint(L_K, (L_Q, sample_k), device= device) # real U = U_part(factor*ln(L_k))*L_q #96x25
+        K_sample = K_expand[:, :, torch.arange(L_Q, device =device).unsqueeze(1), index_sample, :] #32x8x96x25x64
         Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2) #32x8x96x1x64 x 32x8x96x64x25 = 32x8x96x25
 
         # find the Top_k query with sparisty measurement
@@ -117,7 +121,7 @@ class ProbAttention(nn.Module):
         else:
             return (context_in, None)  # 32x8x25x64
 
-    def forward(self, queries, keys, values, attn_mask):  # 32x96x8x64
+    def forward(self, queries, keys, values, attn_mask = None):  # 32x96x8x64
         B, L_Q, H, D = queries.shape  # 32, 96, 8, 64
         _, L_K, _, _ = keys.shape  # 96
 
@@ -134,23 +138,26 @@ class ProbAttention(nn.Module):
         u = u if u < L_Q else L_Q
 
         scores_top, index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u)  # 32x8x96x64, 25, 25 --> #32x8x25x96, 32x8x25
-        a = scores_top/torch.sqrt(torch.tensor(queries.shape[-1]).float())
-        dist_mask_tile = get_dist_mask_tile(a.size(1))
-        a = a + 1 * dist_mask_tile.cuda()
-        dir_mask = torch.triu(torch.ones((a.size(1), a.size(1))), diagonal=1).bool().cuda()
-        a = a.masked_fill(dir_mask, float('-inf')).cuda()
-        #a = F.softmax(a, dim=-1).cuda()
+        a = scores_top*(1.0 / math.sqrt(D))
+        dist_mask_tile = get_dist_mask_tile(a.size(-1)).to(a.device())
+        device = a.device
+        a = a + 1 * dist_mask_tile[None, None, :, :]
+        L_K = a.size(-1)
+        dir_mask = torch.triu(torch.ones((L_K, L_K), device=device), diagonal=1).bool()
+        a = a.masked_fill(dir_mask[None, None, :, :], float('-inf'))
+        a = F.softmax(a, dim=-1).to(device)
 
         # add scale factor
         scale = 1.0 / math.sqrt(D)        # 64 = 0.125
         if scale is not None:
-            scores_top = scores_top * scale  # 32x8x25x96
             # get the context
             context = self._get_initial_context(values, L_Q)  # 32x8x96x64, 96 --> #32x8x96x64
             # update the context with selected top_k queries
             context, attn = self._update_context(context, values, a, index, L_Q, attn_mask)  # 32x8x25x64, #32x8x25x96
 
-            return context.transpose(2, 1).contiguous(), attn  # 32x8x64x25, #32x8x25x96
+            context= context.transpose(2, 1).contiguous() # 32x8x64x25
+            context = context.view(B, L_Q, H*D)  #32x25x512
+            return context, attn #32x512x25, 32x8x25x96
 
 # class QuerySelector(nn.Module):
 #     def __init__(self, fraction=0.33):
@@ -181,37 +188,37 @@ def a_norm(Q, K):
     return torch.softmax(m, -1)
 
 def get_dist_mask_tile(sentence_len):
-    row, col = torch.meshgrid(torch.arange(sentence_len), torch.arange(sentence_len))
+    row, col = torch.meshgrid(torch.arange(sentence_len), torch.arange(sentence_len), indexing = 'ij')
     dis_mask = (row - col).abs()
     dis_mask = 1 / (1 + beta * np.power(dis_mask, 2))
     dis_mask = np.clip(dis_mask, gamma, 1.0)
-    return dis_mask
+    return torch.tensor(dis_mask, dtype=torch.float32)
 
 def attention(Q, K, V):
-    a = a_norm(Q, K).cuda()
-    dist_mask_tile = get_dist_mask_tile(a.size(1)).cuda()
-    a = a + 1 * dist_mask_tile.cuda()
-    dir_mask = torch.triu(torch.ones((a.size(1), a.size(1))), diagonal=1).bool().cuda()
-    a = a.masked_fill(dir_mask, float('-inf')).cuda()
-    a = F.softmax(a, dim=-1).cuda()
+    a = a_norm(Q, K).to(Q.device)
+    device = a.device
+    dist_mask_tile = get_dist_mask_tile(a.size(1)).to(device)
+    a = a + 1 * dist_mask_tile.to(device)
+    L_K = a.size(-1)
+    dir_mask = torch.triu(torch.ones((L_K, L_K), device=device), diagonal=1).bool()
+    a = a.masked_fill(dir_mask[None, None, :, :], float('-inf'))
+    a = F.softmax(a, dim=-1).to(device)
     return torch.matmul(a, V)
 
 class Attention(InferenceModule):
-    def __init__(self, dim_val, dim_attn, debug=False, attn_type='prob'):
+    def __init__(self, dim_val, dim_attn, debug=False, attn_type='prob', args = None):
         super(Attention, self).__init__()
-        self.value = Value(dim_val, dim_val)
-        self.key = Key(dim_val, dim_attn)
-        self.query = Query(dim_val, dim_attn)
+        assert args is not None 
+        self.value = Value(dim_val, dim_val, args)
+        self.key = Key(dim_val, dim_attn, args)
+        self.query = Query(dim_val, dim_attn, args)
         self.debug = debug
+        self.norm = LayerNorm(dim_val)
         self.qk_record = None
         self.qkv_record = None
         self.n = 0
-        originalAttn: ProbAttention
-        self.abits = args.abits
-        self.num_key_value_heads = originalAttn.num_key_value_heads
-        self.num_key_value_groups = originalAttn.num_key_value_groups
-
-        
+        originalAttn= ProbAttention
+        self.abits = args.abits        
         self.act_quant = Quantizer(args=args)
         self.v_quant = Quantizer(args=args)
         self.k_quant = Quantizer(args=args) 
@@ -220,26 +227,28 @@ class Attention(InferenceModule):
         if attn_type == "full":
             self.attentionLayer = None
         elif attn_type.startswith("prob"):
-            self.attentionLayer = ProbAttention(mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False)
+            self.attentionLayer = ProbAttention(mask_flag=True, factor=5, scale=None, attention_dropout=0.1, output_attention=False, args=args)
         else:
             raise Exception
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
             return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(self, x, kv=None):
+        x= self.norm(x)
         if kv is None:
             if self.attentionLayer:
                 qkv = self.attentionLayer(self.query(x), self.key(x), self.value(x))[0]
             else:
                 qkv = attention(self.query(x), self.key(x), self.value(x))
-                qkv = self.act_quant(qkv)
-                return qkv
-        return attention(self.query(x), self.key(kv), self.value(kv))
+        else:
+            qkv = attention(self.query(x), self.key(kv), self.value(kv))
+
+        return self.act_quant(qkv)
 
 class Encoder(InferenceModule):
-    def __init__(self, dim_val, dim_attn, n_heads=1, attn_type='prob'):
+    def __init__(self, dim_val, dim_attn, n_heads=1, attn_type='prob', args= None):
         super(Encoder, self).__init__()
-        self.attn = Truncated_Cauchy_self_attention_layer(dim_val, dim_attn, n_heads, attn_type=attn_type)
+        self.attn = Truncated_Cauchy_self_attention_layer(dim_val, dim_attn, n_heads, attn_type=attn_type, args=args)
 
         self.fc1 = Linear(dim_val, dim_val)
         self.fc2 = Linear(dim_val, dim_val)
@@ -269,11 +278,11 @@ class InferenceModuleList(torch.nn.ModuleList):
                 mod.inference()
 
 class Truncated_Cauchy_self_attention_layer(InferenceModule):
-    def __init__(self, dim_val, dim_attn, n_heads, attn_type):
+    def __init__(self, dim_val, dim_attn, n_heads, attn_type, args):
         super(Truncated_Cauchy_self_attention_layer, self).__init__()
         self.heads = []
         for i in range(n_heads):
-            self.heads.append(Attention(dim_val, dim_attn, attn_type=attn_type))
+            self.heads.append(Attention(dim_val, dim_attn, attn_type=attn_type, args = args))
 
         self.heads = InferenceModuleList(self.heads)
         self.fc = Linear(n_heads * dim_val, dim_val, bias=False)
@@ -357,17 +366,19 @@ class InferenceModule(torch.nn.Module):
 
 class Truncated_Cauchy_self_attention_block(InferenceModule):
     def __init__(self, dim_val, dim_attn, input_size, out_seq_len, n_encoder_layers=1,
-                 enc_attn_type='full', n_heads=1, dropout=0.1, debug=False):
+                 enc_attn_type='full', n_heads=1, dropout=0.1, debug=False, args = None):
         super(Truncated_Cauchy_self_attention_block, self).__init__()
         self._linear = nn.Linear(dim_val, 1)
         # Initiate encoder and Decoder layers
         self.encs = []
+        self.args = args 
         for i in range(n_encoder_layers):
-            self.encs.append(Encoder(dim_val, dim_attn, n_heads, attn_type=enc_attn_type))
+            self.encs.append(Encoder(dim_val, dim_attn, n_heads, attn_type=enc_attn_type, args = self.args))
         self.encs = InferenceModuleList(self.encs)
         self.decs = []
         self.pos = PositionalEncoding(dim_val)
         self.enc_dropout = Dropout(dropout)
+        self.downsample = nn.Conv1d(in_channels=dim_val, out_channels=dim_val, kernel_size = 4, stride = 2, padding= 1)
 
         # Dense layers for managing network inputs and outputs
         self.enc_input_fc = Linear(input_size, dim_val)
@@ -382,13 +393,28 @@ class Truncated_Cauchy_self_attention_block(InferenceModule):
         a = self.enc_input_fc(x)
         b = self.enc_dropout(a)
         c = self.pos(b)
-        e = self.encs[0](c)
-        for enc in self.encs[1:]:
-            e = e.cuda()
+        e = c
+        for i, enc in enumerate(self.encs):
             e = enc(e)
+
+        if self.args.use_downsampling and i % self.args.downsample_every == 0:
+            e = self.downsample(e)
         if self.debug:
             print('Encoder output size: {}'.format(e.shape))
         return e
+class ConvLayer(nn.Module):
+    def __init__(self, c_in):
+        super(ConvLayer, self).__init__()
+        padding = 1 if torch.__version__>='1.5.0' else 2
+        self.norm = nn.BatchNorm1d(c_in)
+        self.activation = nn.ELU()
+        self.maxPool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        x = x.transpose(1,2)
+        x = self.downsample(x)
+        x = x.transpose(1,2)
+        return x
 
     # def record(self):
     #     self.debug = True

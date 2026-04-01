@@ -14,10 +14,10 @@ def get_dist_mask_tile(sentence_len):
         :param sentence_len: Length of attention matrix
         :return: dis_mask: Returns a matrix in which the elements obey the Truncated Cauchy distribution
         """
-    row, col = torch.meshgrid(torch.arange(sentence_len), torch.arange(sentence_len))
+    row, col = torch.meshgrid(torch.arange(sentence_len), torch.arange(sentence_len), indexing='ij')
     dis_mask = (row - col).abs()
-    dis_mask =  1 /(1 + beta*np.power(dis_mask, 2))
-    dis_mask = np.clip(dis_mask,gamma,1.0)
+    dis_mask = 1 / (1 + beta * (dis_mask ** 2))
+    dis_mask = torch.clamp(dis_mask, gamma, 1.0)
     return dis_mask
 
 class Truncated_Cauchy_self_attention_layer(nn.Module):
@@ -28,11 +28,7 @@ class Truncated_Cauchy_self_attention_layer(nn.Module):
     tensor of shape (batch_size, L, d_model).
     """
     def __init__(self,
-                 d_model: int,
-                 q: int,
-                 v: int,
-                 h: int,
-                 attention_size: int = None):
+                 d_model: int, q: int, v: int, h: int, attention_size: int = None, args = None):
         """
         :param d_model: Dimension of the input vector.
         :param q: Dimension of all query matrix.
@@ -42,16 +38,16 @@ class Truncated_Cauchy_self_attention_layer(nn.Module):
         Deactivated if ``None``. Default is ``None``.
         """
         super().__init__()
-        self._dopout = nn.Dropout(p=0.1)
+        self._dropout = nn.Dropout(p=0.1)
         self._h = h
 
         # Query, keys and value matrices
         self._W_q = nn.Linear(d_model, q * self._h)
         self._W_k = nn.Linear(d_model, q * self._h)
-        self._W_v = nn.Linear(d_model, v * self._h)
+        self._W_v = QLinearLayer(nn.Linear(d_model, v * self._h), args = args)
 
         # Output linear function
-        self._W_o = nn.Linear(self._h * v, d_model)
+        self._W_o = QLinearLayer(nn.Linear(self._h * v, d_model), args = args)
 
         # Score placeholder
         self._scores = None
@@ -72,21 +68,20 @@ class Truncated_Cauchy_self_attention_layer(nn.Module):
         :param mask: Mask to apply on scores before computing attention. One of ``'subsequent'``, None. Default is None.
         :return: attention: Self attention tensor with shape (batch_size, L, d_model).
         """
-        K = query.shape[1]
 
         # Compute Q, K and V, concatenate heads on batch dimension
         queries = torch.cat(self._W_q(query).chunk(self._h, dim=-1), dim=0)
-        keys = torch.cat(self._W_k(key).chunk(self._h, dim=-1), dim=0)  #
+        keys = torch.cat(self._W_k(key).chunk(self._h, dim=-1), dim=0)  
         values = torch.cat(self._W_v(value).chunk(self._h, dim=-1), dim=0)
-
+        K = queries.shape[-1]
         # Add a new matrix which obeys Truncated Cauchy distribution to original attention matrix
-        self._scores = torch.bmm(query, key.transpose(1, 2)) / np.sqrt(K)
-        dist_mask_tile = get_dist_mask_tile(self._scores.shape[1])
+        self._scores = torch.bmm(queries, keys.transpose(1, 2)) / np.sqrt(K)
+        dist_mask_tile = get_dist_mask_tile(self._scores.shape[1]).to(self._scores.device)
         diagonal_zero_mask = np.ones([self._scores.shape[1], self._scores.shape[1]]) -  np.diag([1.0] * self._scores.shape[1])
-        diagonal_zero_mask=torch.tensor(diagonal_zero_mask)
+        diagonal_zero_mask=torch.tensor(diagonal_zero_mask).to(self._scores.device)
         dist_mask_tile=dist_mask_tile*diagonal_zero_mask
         self._scores += dist_mask_tile#.cuda()
-        dir_mask = torch.triu(torch.ones((self._scores.shape[1], self._scores.shape[1])), diagonal=1).bool()#.cuda()
+        dir_mask = torch.triu(torch.ones((self._scores.shape[1], self._scores.shape[1])), diagonal=1).bool().to(self._scores.device)
         self._scores = self._scores.masked_fill(dir_mask, float('-inf'))#.cuda()
 
         # Compute future mask
@@ -97,7 +92,10 @@ class Truncated_Cauchy_self_attention_layer(nn.Module):
 
         # Apply sotfmax
         self._scores = F.softmax(self._scores, dim=-1)
-        attention = torch.bmm(self._scores, value)
+        attention = torch.bmm(self._scores, values)
+        attention = attention.view(self._h, query.shape[0], query.shape[1], -1)
+        attention = attention.permute(1, 2, 0, 3).contiguous().view(query.shape[0], query.shape[1], -1)
+        attention = self._W_o(attention)
         return attention
 
     @property
@@ -111,32 +109,15 @@ class Truncated_Cauchy_self_attention_layer(nn.Module):
         return self._scores
 class PositionwiseFeedForward(nn.Module):
     """A two-feed-forward-layer module """
-    def __init__(self,
-                 d_model: int,
-                 d_ff: Optional[int] = 90):
+    def __init__(self, d_model: int, d_ff: Optional[int] = 90, args = None):
 
         super().__init__()
-        self._linear1 = nn.Linear(d_model, d_ff)
-        self._linear2 = nn.Linear(d_ff, d_model)
+        self._linear1 = QLinearLayer(nn.Linear(d_model, d_ff), args = args)
+        self._linear2 = QLinearLayer(nn.Linear(d_ff, d_model), args = args)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._linear2(F.relu(self._linear1(x)))
     
-class ConvLayer(nn.Module):
-    def __init__(self, c_in):
-        super(ConvLayer, self).__init__()
-        padding = 1 if torch.__version__>='1.5.0' else 2
-        self.downsample = nn.Conv1d(in_channels=c_in, out_channels=c_in, kernel_size = 4, stride = 2, padding=padding, padding_mode='zeros')
-        self.norm = nn.BatchNorm1d(c_in)
-        self.activation = nn.ELU()
-        self.maxPool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
-
-    def forward(self, x):
-        x = x.transpose(1,2)
-        x = self.downsample(x)
-        x = x.transpose(1,2)
-        return x
-
 class Encoder(nn.Module):
     """Encoder layer  is made up of Truncated Cauchy self-attn layer and feed forward (defined below)"""
     def __init__(self,
@@ -146,17 +127,16 @@ class Encoder(nn.Module):
                  h: int,
                  attention_size: int = None,
                  dropout: float = 0.3,
-                 chunk_mode: str = 'chunk'):
+                 chunk_mode: str = 'chunk', args = None):
         super().__init__()
         Truncated_Cauchy_SA = Truncated_Cauchy_self_attention_layer
-        self._selfAttention = Truncated_Cauchy_SA(d_model, q, v, h, attention_size=attention_size)
-        self._feedForward = PositionwiseFeedForward(d_model)
+        self._selfAttention = Truncated_Cauchy_SA(d_model, q, v, h, attention_size=attention_size, args = args)
+        self._feedForward = PositionwiseFeedForward(d_model, args = args)
 
         self._layerNorm1 = nn.LayerNorm(d_model)
         self._layerNorm2 = nn.LayerNorm(d_model)
-        self.act_quant = Quantizer(args=args)
-        
-        self._dopout = nn.Dropout(p=dropout)
+        self.act_quant = Quantizer(args=args) if args is not None else None
+        self._dropout = nn.Dropout(p=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -171,15 +151,14 @@ class Encoder(nn.Module):
         # each encoder layer
         residual = x
         x = self._selfAttention(query=x, key=x, value=x) # Truncated Cauchy self-attention layer
-        x = self._dopout(x)
-        x = ConvLayer(x)
-        x= x.act_quant(x)
+        x = self._dropout(x)
         x = self._layerNorm1(x + residual)
-
+        if self.act_quant is not None:
+            x = self.act_quant(x)
         # Feed forward
         residual = x
         x = self._feedForward(x)
-        x = self._dopout(x)
+        x = self._dropout(x)
         x = self._layerNorm2(x + residual)
 
         return x

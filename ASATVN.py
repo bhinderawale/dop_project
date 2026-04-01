@@ -62,10 +62,10 @@ class ASATVN:
         #     self.model = nn.DataParallel(self.model)
 
         #  Create self-attentive discriminator model
-        self.discriminator1 = Self_attentive_discriminator(1, d_model, hidden_dim, 1, d_model, d_model, 1, 1,
+        self.discriminator1 = Self_attentive_discriminator(1, d_model, hidden_dim, 4, d_model, d_model, 1, 1,
                                               attention_size=12, dropout=0, chunk_mode=None, pe='regular',
                                               is_discriminator=True)
-        self.discriminator2 = Self_attentive_discriminator(1, d_model, hidden_dim, 1, d_model, d_model, 1, 1,
+        self.discriminator2 = Self_attentive_discriminator(1, d_model, hidden_dim, 4, d_model, d_model, 1, 1,
                                               attention_size=12, dropout=0, chunk_mode=None, pe='regular',
                                               is_discriminator=True)
         self.discriminator1.to(self.device)
@@ -76,7 +76,9 @@ class ASATVN:
         # Define the optimizer
         lr_warmup = True
         lr_schedule = 'warmup_constant'
-        n_updates_total = (self.train_x.__len__() // batch_size) * n_epochs
+        # train_x shape is [time, batch, features], so get batch dimension (shape[1])
+        n_samples = self.train_x.shape[1] if len(self.train_x.shape) > 2 else self.train_x.shape[0]
+        n_updates_total = (n_samples // batch_size) * n_epochs
         self.optimizer_G = OpenAIAdam(self.model.parameters(),
                                  lr=self.learning_rate,
                                  schedule=lr_schedule,
@@ -131,17 +133,18 @@ class ASATVN:
         with torch.no_grad():
 
             if type(test_x) is np.ndarray:
-                test_x = torch.from_numpy(test_x).type(torch.FloatTensor)  ##（36，3，1）
+                test_x = torch.from_numpy(test_x).type(torch.FloatTensor)
 
             # Format the inputs
-            test_x = format_input(test_x)##（3，36）
+            test_x = format_input(test_x)
+            
             # Dummy output
-            empty_y = torch.empty((self.out_seq_length, test_x[:, :predict_start].shape[1], self.output_dim))  # （12 24 1）
+            empty_y = torch.empty((self.out_seq_length, test_x.shape[0], self.output_dim))
             test_x = test_x.to(self.device)
             empty_y = empty_y.to(self.device)
 
             # Compute the forecast
-            y_hat = self.model(test_x[:, :predict_start], empty_y, is_training=False)
+            y_hat = self.model(test_x, empty_y, is_training=False)
         return y_hat.cpu().numpy()
 
 

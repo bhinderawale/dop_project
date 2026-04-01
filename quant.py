@@ -11,11 +11,12 @@ def fake_quantize_quarter_E5M2(w: torch.tensor) -> torch.tensor:
     # Exponent: 0111 1100 0000 0000 HEX: 0x7C00
     # Mantissa: 0000 0011 1111 1111 HEX: 0x03FF
     assert w.dtype == torch.float16
-    w = w.view(torch.int16).cuda()
+    device = w.device
+    w = w.view(torch.int16).to(device)
     # FP16: S1E5M10
     # FP8 : S1E5M2
     mantissa = w & 0x03FF
-    roundFloat = (((mantissa << 2) & 0x03FF) + 0x3C00).clone().view(torch.float16).cuda()
+    roundFloat = (((mantissa << 2) & 0x03FF) + 0x3C00).clone().view(torch.float16).to(device)
     roundingBits = (torch.round(roundFloat) - 1).to(dtype=torch.int16)
     mantissa = ((mantissa >> 8) + roundingBits) << 8
 
@@ -31,7 +32,7 @@ def fake_quantize_quarter_E4M3(w: torch.tensor) -> torch.tensor:
     # Mantissa: 0000 0011 1111 1111 HEX: 0x03FF
     assert w.dtype == torch.float16
     # Maximum number of FP8 E4M3 should be (0 1111 111) = 480
-    w = w.cuda()
+    w = w.to(device)
     w = torch.clamp(w, -480, 480)
 
     # Manipulate bits
@@ -41,7 +42,7 @@ def fake_quantize_quarter_E4M3(w: torch.tensor) -> torch.tensor:
     # Need consider rounding case
     # Just construct a float16 to see whether to round 1 bits
     mantissa = w & 0x03FF
-    roundFloat = (((mantissa << 3) & 0x03FF) + 0x3C00).clone().view(torch.float16).cuda()
+    roundFloat = (((mantissa << 3) & 0x03FF) + 0x3C00).clone().view(torch.float16).to(device)
     roundingBits = (torch.round(roundFloat) - 1).to(dtype=torch.int16)
     mantissa = ((mantissa >> 7) + roundingBits) << 7
 
@@ -52,7 +53,7 @@ def fake_quantize_quarter_E4M3(w: torch.tensor) -> torch.tensor:
     # Min Submormal Value:  0 0000 001 = 2^-9
     exponent = (w & 0x7C00) >> 10
     subNormalMask = (exponent - 15) < -6
-    subNormal_min = torch.tensor(2**(-9), dtype=torch.float16, device='cuda')
+    subNormal_min = torch.tensor(2**(-9), dtype=torch.float16, device= w.device)
     w = w.view(torch.float16)
     w[subNormalMask] = torch.round(w[subNormalMask] / subNormal_min).to(dtype=torch.int16) * subNormal_min
     
@@ -105,6 +106,29 @@ def quantize_tensor_channel_group(W: torch.tensor, n_bits, group_size, tiling, s
             W[:,i1:i2] = w
 
     return W.contiguous()
+def enable_dynamic_AQ(model, args):
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            module.act_quant = lambda x: quantize_activation_wrapper(x, args)
+def quantize_model_func(model, device, args):
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            weight = module.weight.data
+
+            quant_w = quantize_tensor(
+                weight,
+                n_bits=args.wbits,
+                group_size=args.weight_group_size,
+                tiling=args.tiling,
+                sym=args.w_sym,
+                clip_ratio=args.w_clip_ratio,
+                exponential=args.exponential,
+                quant_type=args.quant_type
+            )
+
+            module.weight.data = quant_w
+
+    return model
 
 # Basic tool function for quantization
 # w: input tensor. should be either grouped with group_size = 0 or group_size > 0

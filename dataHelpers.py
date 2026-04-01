@@ -43,7 +43,7 @@ def generate_data(data,period):
 
     T_in_seq = 2 * period
     T_out_seq = period
-    dataset=data.reshape(-1,1)
+    dataset = data  # Preserve [T, features] shape for multivariate input
 
     n_samples = len(dataset) - T_in_seq - T_out_seq + 1
     test_idx = n_samples - int(0.2 * n_samples)
@@ -71,5 +71,5 @@ def format_input(input):
     """
     in_seq_length, batch_size, input_dim = input.shape
     input_reshaped = input.permute(1, 0, 2)
-    input_reshaped = torch.reshape(input_reshaped, (batch_size, -1))
+    #input_reshaped = torch.reshape(input_reshaped, (batch_size, -1))
     return input_reshaped

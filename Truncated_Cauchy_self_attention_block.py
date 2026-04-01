@@ -54,14 +54,14 @@ class Truncated_Cauchy_self_attention_block(nn.Module):
     def __init__(self, d_input: int, d_model: int, hidden_dim: int, d_output: int, q: int, v: int, h: int, M: int,
                  attention_size: int = None, dropout: float = 0.3, chunk_mode: bool = True, pe: str = 'original',is_discriminator:bool=None):
         super().__init__()
-        self.input_layer1=nn.Linear(12,hidden_dim)
-        self.input_layer2 = nn.Linear(36, hidden_dim)
+        #self.input_layer1=nn.Linear(d_input ,hidden_dim)
+        #self.input_layer2 = nn.Linear(3*d_input, hidden_dim)
         self.is_discriminator=is_discriminator
         self._d_model = d_model
         self.layers_encoding = nn.ModuleList(
             [Encoder(d_model, q, v, h, attention_size=attention_size, dropout=dropout, chunk_mode=chunk_mode) for _ in
              range(M)])
-        self._embedding = nn.Linear(d_input, d_model)
+        self._embedding = nn.Linear(hidden_dim, d_model)
         self._linear = nn.Linear(d_model, d_output)
 
         pe_functions = {
@@ -84,15 +84,19 @@ class Truncated_Cauchy_self_attention_block(nn.Module):
         :param x: class:`torch.Tensor` of shape (batch_size, L).
         :return: output: Output tensor with shape (batch_size, L, d_output).
         """
-        if self.is_discriminator and x.size(1)==12:
-            x=self.input_layer1(x)
-        if self.is_discriminator and x.size(1) == 36:
-            x = self.input_layer2(x)
-        x = torch.unsqueeze(x, 2)
+        #if self.is_discriminator and x.size(1)==12:
+         #   x=self.input_layer1(x)
+       # if self.is_discriminator and x.size(1) == 36:
+        #    x = self.input_layer2(x)
+        # Do not unsqueeze; x should be [batch, d_input]
         K = x.shape[1]  # 3 4 8
 
         # Input layer
+        #print("inside attention, x shape:", x.shape)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)  # (B, 1, D)
         encoding = self._embedding(x)
+        #print("inside attention, x shape:", x.shape)
 
         # Position encoding
         if self._generate_PE is not None:

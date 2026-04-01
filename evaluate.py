@@ -19,8 +19,8 @@ def evaluate(ASA, test_x, test_y, return_lists=False):
     :return: nrmse: Normalised root mean squared error
     """
     ASA.model.eval()
-    predict_start = 24
-
+    predict_start = 2 * ASA.period
+    
     # Load model parameters
     checkpoint = torch.load(ASA.save_file, map_location=ASA.device)
     ASA.model.load_state_dict(checkpoint['model_state_dict'])
@@ -34,6 +34,9 @@ def evaluate(ASA, test_x, test_y, return_lists=False):
 
         # Format the inputs
         test_x = format_input(test_x)
+        
+        # Account for flattened input
+        predict_start_flat = predict_start * ASA.input_dim
 
         # Send to CPU/GPU
         test_x = test_x.to(ASA.device)
@@ -43,17 +46,14 @@ def evaluate(ASA, test_x, test_y, return_lists=False):
         n_samples = test_x.shape[0]
 
         # Inference
-        y_pred_list = []
-        # Compute outputs for a mixture density network output
-        # Compute outputs for a linear output
-        y_pred = ASA.model(test_x[:, :predict_start], test_y[predict_start:, :, :], is_training=False)
+        y_pred = ASA.model(test_x[:, :predict_start_flat], test_y[predict_start:, :, :], is_training=False)
 
         mase_list = []
         smape_list = []
         nrmse_list = []
         for i in range(n_samples):
             mase, se, smape, nrmse = calculate_error(y_pred[:, i, :].cpu().numpy(), test_y[predict_start:, :, :][:, i,
-                                                                                    :].cpu().numpy())  # y_pred 和test_y 最后的shape是什么样子的
+                                                                                    :].cpu().numpy())  
             mase_list.append(mase)
             smape_list.append(smape)
             nrmse_list.append(nrmse)

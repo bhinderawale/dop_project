@@ -54,6 +54,9 @@ class OpenAIAdam(Optimizer):
             loss = closure()
 
         for group in self.param_groups:
+            # Clip gradients once per parameter group (more efficient than per-parameter)
+            if group.get('max_grad_norm', -1) > 0:
+                clip_grad_norm_(group['params'], group['max_grad_norm'])
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -76,12 +79,10 @@ class OpenAIAdam(Optimizer):
 
                 state['step'] += 1
 
-                # Add grad clipping
-                if group['max_grad_norm'] > 0:
-                    clip_grad_norm_(p, group['max_grad_norm'])
+                # Gradients already clipped per group above
 
                 # Decay the first and second moment running average coefficient
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
                 denom = exp_avg_sq.sqrt().add_(group['e'])
 
@@ -96,7 +97,7 @@ class OpenAIAdam(Optimizer):
 
                 # Add weight decay at the end (fixed version)
                 if (len(p.size()) > 1 or group['vector_l2']) and group['l2'] > 0:
-                    p.data.add_(-lr_scheduled * group['l2'], p.data)
+                    p.data.add_(p.data, alpha=-lr_scheduled * group['l2'])
 
         return loss
 
